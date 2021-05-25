@@ -1,6 +1,8 @@
 click~=7.1.2
 ffmpeg-python~=0.2.0
+flask~=1.1.2
 furl~=2.1.0
+inquirer~=2.7.0
 ipodshuffle~=0.4.1
 keyring~=21.4.0
 mutagen~=1.45.1

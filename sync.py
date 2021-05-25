@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
-from furl import furl
+from functools import wraps
 import logging
 import os
 import re
@@ -12,13 +12,19 @@ from pathlib import Path
 
 import click
 import ffmpeg
+import inquirer
 import keyring
 import requests
+from flask import abort, Flask, request, send_file
+from furl import furl
 from mutagen.easyid3 import EasyID3
+from mutagen.mp3 import MP3
 from rich.logging import RichHandler
 
 from ipod import Shuffler
 
+
+app = Flask(__name__)
 
 logging.basicConfig(
     level="INFO",
@@ -27,6 +33,13 @@ logging.basicConfig(
     handlers=[RichHandler(rich_tracebacks=True)]
 )
 log = logging.getLogger(__name__)
+
+# Config
+MUSIC_DIR = Path('music')
+PLAYLIST_NAME = 'Shuffleupagus'
+PLAYLIST_ID = '95f83b1d-1d5d-4626-bcdd-bf3a1a8a0b6e'
+USERNAME = keyring.get_credential("Pocket Casts", "username").password
+PASSWORD = keyring.get_credential("Pocket Casts", USERNAME).password
 
 
 @dataclass(frozen=True)
@@ -52,6 +65,14 @@ class Episode:
     def filename(self) -> str:
         return f"{self.uuid}{self.extension}"
 
+    @property
+    def path(self):
+        return MUSIC_DIR / self.filename
+   
+    @property
+    def duration(self) -> int:
+        return int(MP3(self.path).info.length)
+    
 
 @dataclass
 class PocketCasts:
@@ -73,11 +94,9 @@ class PocketCasts:
 
 @contextmanager
 def pocket_casts():
-    username: str = keyring.get_credential("Pocket Casts", "username").password
-    password: str = keyring.get_credential("Pocket Casts", username).password
     with requests.Session() as session:
         with session.post('https://api.pocketcasts.com/user/login',
-                          json={"email": username, "password": password}) as response:
+                          json={"email": USERNAME, "password": PASSWORD}) as response:
             content = response.json()
             token = content["token"]
         session.headers.update({"Authorization": f"Bearer {token}"})
@@ -100,14 +119,14 @@ def speedup(input: str, output: str) -> None:
     )
 
 
-def download_episode(playlist_path: Path, episode: Episode) -> t.Tuple[bool, Episode]:
+def download_episode(episode: Episode) -> t.Tuple[bool, Episode]:
     try:
         contents = requests.get(str(episode.url)).content
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
             input_filename = temp_file.name
             temp_file.write(contents)
 
-        speedup(input_filename, str((playlist_path / episode.filename).resolve()))
+        speedup(input_filename, str(episode.path.resolve()))
 
     except Exception:
         log.exception("Error downloading or speeding up %s", episode.url)
@@ -122,20 +141,29 @@ def download_episode(playlist_path: Path, episode: Episode) -> t.Tuple[bool, Epi
     return True, episode
 
 
-@click.command()
-@click.option("-i", "--ipod-dir", default="/Volumes/IPOD", help="path to iPod mount point")
-@click.option("-p", "--playlist", default="shuffleupagus", help="name of synced playlist")
-def sync(ipod_dir, playlist):
+def sync():
     with pocket_casts() as api:
         # Get all podcast titles
         titles_by_uuid: t.Dict[str, str] = api.podcasts()
 
         # Get list of episodes in "up next"
         episodes_from_pocketcasts: t.List[Episode] = api.up_next()
+        selected_episodes = inquirer.prompt([inquirer.Checkbox(
+            name='episodes',
+            message='Select episodes to download:',
+            default=[episode.uuid for episode in episodes_from_pocketcasts[1:]],
+            choices=[(episode.title, episode.uuid) for episode in episodes_from_pocketcasts],
+        )])
 
-        # Get files in the playlist on the iPod
+        pocketcasts_by_uuid: t.Dict[str, Episode] = {
+            episode.uuid: episode
+            for episode in episodes_from_pocketcasts
+            if episode.uuid in selected_episodes['episodes']
+        }
+
+        # Get previously-downloaded files
         ipod_by_uuid: t.Dict[str, Path] = {}
-        playlist_path = Path(ipod_dir) / "iPod_Control" / "Music" / playlist
+        playlist_path = MUSIC_DIR
         playlist_path.mkdir(parents=True, exist_ok=True)
         filename_regex = re.compile(r"([a-f0-9-]+)\..+")
         for file in playlist_path.iterdir():
@@ -145,7 +173,6 @@ def sync(ipod_dir, playlist):
                 continue
             ipod_by_uuid[filename_match.group(1)] = file
 
-        pocketcasts_by_uuid: t.Dict[str, Episode] = {episode.uuid: episode for episode in episodes_from_pocketcasts}
 
         uuids_on_ipod = set(ipod_by_uuid.keys())
         uuids_from_pocketcasts = set(pocketcasts_by_uuid.keys())
@@ -156,15 +183,16 @@ def sync(ipod_dir, playlist):
         for uuid in uuids_to_delete:
             ipod_by_uuid[uuid].unlink()
 
+        episodes_to_download = [pocketcasts_by_uuid[uuid] for uuid in uuids_to_download]
+
+        if episodes_to_download:
+            log.info("Downloading %r", [episode.title for episode in episodes_to_download])
         with ThreadPool() as pool:
-            for success, episode in pool.imap_unordered(
-                partial(download_episode, playlist_path),
-                (pocketcasts_by_uuid[uuid] for uuid in uuids_to_download),
-            ):
+            for success, episode in pool.imap_unordered(download_episode, episodes_to_download):
                 if success:
                     log.info("Downloaded %s: %s", episode.title, episode.filename)
                     try:
-                        tags = EasyID3(playlist_path / episode.filename)
+                        tags = EasyID3(episode.path)
                         tags["title"] = episode.title
                         tags["genre"] = "Podcast"
                         try:
@@ -175,6 +203,84 @@ def sync(ipod_dir, playlist):
                     except Exception:
                         log.exception("Could not rename %r", episode)
 
+        return pocketcasts_by_uuid
 
-if __name__ == "__main__":
-    sync()
+
+episodes = sync()
+
+
+def auth(f):
+    @wraps(f)
+    def inner():
+        if request.args.get("u") == USERNAME and request.args.get("p") == PASSWORD:
+            return f()
+        abort(401)
+
+    return inner
+
+
+def make_response(dict):
+    return {
+      "subsonic-response": {
+            "status": "ok",
+            "version": "1.10.2",
+        } | dict,
+    }
+
+
+@app.route('/rest/ping')
+def ping():
+    return make_response({})
+
+
+@app.route('/rest/scrobble')
+def scrobble():
+    return make_response({})
+
+
+@app.route('/rest/getPlaylists')
+def get_playlists():
+    return make_response({
+        "playlists": {
+            "playlist": [
+                {
+                  "id": PLAYLIST_ID,
+                  "name": PLAYLIST_NAME,
+                  "songCount": len(episodes),
+                },
+            ],
+        },
+    })
+
+
+@app.route('/rest/getPlaylist')
+def get_playlist():
+    if not (playlist_id := request.args.get('id')):
+        abort(400)
+
+    entries = []
+    if playlist_id == str(PLAYLIST_ID):
+        entries = [{
+          "contentType": "audio/mpeg",
+          "duration": episode.duration,
+          "id": episode.uuid,
+          "title": episode.title,
+        }
+        for episode in episodes.values()]
+
+    return make_response({
+        "playlist": {
+            "entry": entries,
+            "id": playlist_id,
+            "name": PLAYLIST_NAME,
+            "songCount": len(entries),
+        },
+    })
+
+
+@app.route('/rest/stream')
+def stream():
+    if not (episode_id := request.args.get('id')):
+        abort(400)
+
+    return send_file(episodes[episode_id].path)

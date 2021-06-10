@@ -1,0 +1,7 @@
+# ffmpeg-python~=0.2.0
+flask~=1.1.2
+mutagen~=1.45.1
+requests~=2.25.1
+kivy[base]~=2.0.0
+python-for-android~=2020.6.2
+cython

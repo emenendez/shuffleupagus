@@ -37,6 +37,9 @@ class Episode:
     title: str
     podcast: str
 
+    filename_regex = re.compile(r"\d+_([a-f0-9-]+)\..+")
+
+
     @classmethod
     def from_dict(cls, order: int, dict: t.Dict) -> "Episode":
         input_dict = dict.copy()
@@ -50,7 +53,14 @@ class Episode:
 
     @property
     def filename(self) -> str:
-        return f"{self.uuid}{self.extension}"
+        return f"{self.order:02}_{self.uuid}{self.extension}"
+
+    @classmethod
+    def uuid_from_filename(cls, filename):
+        filename_match = cls.filename_regex.match(filename)
+        if not filename_match:
+            raise ValueError(f"Cannot parse filename {file}")
+        return filename_match.group(1)
 
 
 @dataclass
@@ -125,7 +135,8 @@ def download_episode(playlist_path: Path, episode: Episode) -> t.Tuple[bool, Epi
 @click.command()
 @click.option("-i", "--ipod-dir", default="/Volumes/IPOD", help="path to iPod mount point")
 @click.option("-p", "--playlist", default="shuffleupagus", help="name of synced playlist")
-def sync(ipod_dir, playlist):
+@click.option("-G/-g", "--generate/--no-geerate", default=True)
+def sync(ipod_dir, playlist, generate):
     with pocket_casts() as api:
         # Get all podcast titles
         titles_by_uuid: t.Dict[str, str] = api.podcasts()
@@ -137,13 +148,13 @@ def sync(ipod_dir, playlist):
         ipod_by_uuid: t.Dict[str, Path] = {}
         playlist_path = Path(ipod_dir) / "iPod_Control" / "Music" / playlist
         playlist_path.mkdir(parents=True, exist_ok=True)
-        filename_regex = re.compile(r"([a-f0-9-]+)\..+")
         for file in playlist_path.iterdir():
-            filename_match = filename_regex.match(file.name)
-            if not filename_match:
-                log.error("Cannot parse filename %s", file)
+            try:
+                uuid = Episode.uuid_from_filename(file.name)
+            except ValueError as e:
+                log.error(e)
                 continue
-            ipod_by_uuid[filename_match.group(1)] = file
+            ipod_by_uuid[uuid] = file
 
         pocketcasts_by_uuid: t.Dict[str, Episode] = {episode.uuid: episode for episode in episodes_from_pocketcasts}
 
@@ -174,6 +185,18 @@ def sync(ipod_dir, playlist):
                         tags.save()
                     except Exception:
                         log.exception("Could not rename %r", episode)
+
+    if generate: 
+        shuffle = Shuffler(ipod_dir,
+                           track_voiceover=False,
+                           playlist_voiceover=False,
+                           rename=True,
+                           trackgain=0,
+                           auto_dir_playlists=0,
+                           auto_id3_playlists=None)
+        shuffle.initialize()
+        shuffle.populate()
+        shuffle.write_database()
 
 
 if __name__ == "__main__":

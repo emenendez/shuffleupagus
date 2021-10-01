@@ -30,6 +30,11 @@ def make_dir_if_absent(path):
         if exc.errno != errno.EEXIST:
             raise
 
+
+def verboseprint(*args, **kwargs):
+    print(*args, **kwargs)
+
+
 def raises_unicode_error(str):
     try:
         str.encode('latin-1')

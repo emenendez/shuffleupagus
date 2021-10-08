@@ -163,9 +163,13 @@ def sync(ipod_dir, playlist, generate):
 
         uuids_to_delete = uuids_on_ipod - uuids_from_pocketcasts
         uuids_to_download = uuids_from_pocketcasts - uuids_on_ipod
+        uuids_to_rename = uuids_on_ipod & uuids_from_pocketcasts
 
         for uuid in uuids_to_delete:
             ipod_by_uuid[uuid].unlink()
+
+        for uuid in uuids_to_rename:
+            ipod_by_uuid[uuid].rename(playlist_path / pocketcasts_by_uuid[uuid].filename)
 
         with ThreadPool() as pool:
             for success, episode in pool.imap_unordered(
